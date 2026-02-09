@@ -1,0 +1,49 @@
+{
+  "name": "sf-cli-migrator",
+  "version": "1.0.0",
+  "description": "Salesforce CLI plugin to migrate ContentDocument files between orgs",
+  "type": "module",
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "license": "MIT",
+  "scripts": {
+    "build": "tsc -b",
+    "clean": "rm -rf lib",
+    "test": "mocha test/**/*.test.ts --timeout 10000"
+  },
+  "dependencies": {
+    "@oclif/core": "^4",
+    "@salesforce/core": "^8",
+    "@salesforce/sf-plugins-core": "^12",
+    "chalk": "^5.3.0",
+    "fs-extra": "^11.2.0",
+    "inquirer": "^9.2.12",
+    "inquirer-autocomplete-prompt": "^3.0.1"
+  },
+  "devDependencies": {
+    "@types/fs-extra": "^11",
+    "@types/inquirer": "^9",
+    "@types/mocha": "^10",
+    "@types/node": "^20",
+    "chai": "^4",
+    "mocha": "^10",
+    "sinon": "^17",
+    "typescript": "^5"
+  },
+  "oclif": {
+    "bin": "sf",
+    "commands": "./lib/commands",
+    "topicSeparator": " ",
+    "flexibleTaxonomy": true,
+    "topics": {
+      "fileorg": {
+        "description": "Commands for migrating files between Salesforce orgs"
+      }
+    }
+  },
+  "files": [
+    "lib",
+    "messages",
+    "oclif.manifest.json"
+  ]
+}
