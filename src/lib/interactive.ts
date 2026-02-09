@@ -240,11 +240,11 @@ async function startMigration(logger: MigrationLogger): Promise<void> {
     })),
   ];
 
-  const { matchField } = await inquirer.prompt([
+  const { sourceMatchField } = await inquirer.prompt([
     {
       type: 'autocomplete',
-      name: 'matchField',
-      message: 'Match field (start typing to filter):',
+      name: 'sourceMatchField',
+      message: 'Source match field (field on source org to match by):',
       source: (_answers: unknown, input: string) => {
         const term = (input || '').toLowerCase();
         if (!term) return fieldChoices;
@@ -255,6 +255,65 @@ async function startMigration(logger: MigrationLogger): Promise<void> {
       pageSize: 12,
     },
   ]);
+
+  // Ask if the target uses a different match field
+  const { useDifferentTargetField } = await inquirer.prompt([
+    {
+      type: 'confirm',
+      name: 'useDifferentTargetField',
+      message: `Use a different field on the target org? (Currently: ${sourceMatchField})`,
+      default: false,
+    },
+  ]);
+
+  let targetMatchField = sourceMatchField;
+  if (useDifferentTargetField) {
+    // Describe the target org's object to get its fields
+    let targetFields: FieldInfo[];
+    try {
+      logger.startSpinner(`Describing ${objectApiName} on target org...`);
+      targetFields = await getObjectFields(targetConn!, objectApiName);
+      logger.stopSpinner(`${objectApiName}: ${targetFields.length} fields found on target.`);
+    } catch (err) {
+      logger.stopSpinnerFail(`Could not describe ${objectApiName} on target: ${(err as Error).message}`);
+      return;
+    }
+
+    const targetRecommended = targetFields.filter(
+      (f) => f.externalId || f.unique || f.idLookup || f.name === 'Name'
+    );
+    const targetOthers = targetFields.filter((f) => !targetRecommended.includes(f));
+
+    const targetFieldChoices = [
+      ...targetRecommended.map((f) => ({
+        name: `${f.name} — ${f.label}${f.externalId ? chalk.green(' [External ID]') : ''}${f.unique ? chalk.yellow(' [Unique]') : ''}${f.idLookup ? chalk.dim(' [IdLookup]') : ''}`,
+        value: f.name,
+        short: f.name,
+      })),
+      ...targetOthers.map((f) => ({
+        name: `${f.name} — ${f.label}`,
+        value: f.name,
+        short: f.name,
+      })),
+    ];
+
+    const answer = await inquirer.prompt([
+      {
+        type: 'autocomplete',
+        name: 'targetMatchField',
+        message: 'Target match field (field on target org to match against):',
+        source: (_answers: unknown, input: string) => {
+          const term = (input || '').toLowerCase();
+          if (!term) return targetFieldChoices;
+          return targetFieldChoices.filter(
+            (c) => c.value.toLowerCase().includes(term) || c.name.toLowerCase().includes(term)
+          );
+        },
+        pageSize: 12,
+      },
+    ]);
+    targetMatchField = answer.targetMatchField;
+  }
 
   const { whereClause } = await inquirer.prompt([
     {
@@ -274,9 +333,13 @@ async function startMigration(logger: MigrationLogger): Promise<void> {
     },
   ]);
 
+  const matchDisplay = sourceMatchField === targetMatchField
+    ? sourceMatchField
+    : `${sourceMatchField} → ${targetMatchField}`;
+
   console.log(chalk.cyan('\n  ── Migration Configuration ──'));
   console.log(`  Object:      ${objectApiName}`);
-  console.log(`  Match Field: ${matchField}`);
+  console.log(`  Match:       ${matchDisplay}`);
   console.log(`  Filter:      ${whereClause || '(all records)'}`);
   console.log(`  Mode:        ${dryRun ? 'DRY RUN (preview)' : chalk.yellow('LIVE — will write to target')}`);
   console.log(`  Source:      ${sourceLabel}`);
@@ -305,7 +368,8 @@ async function startMigration(logger: MigrationLogger): Promise<void> {
     sourceConn,
     targetConn,
     objectApiName,
-    matchField,
+    sourceMatchField,
+    targetMatchField,
     whereClause: whereClause || undefined,
     dryRun,
     logger,

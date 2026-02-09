@@ -36,7 +36,7 @@
     "topicSeparator": " ",
     "flexibleTaxonomy": true,
     "topics": {
-      "fileorg": {
+      "filebuddy": {
         "description": "Commands for migrating files between Salesforce orgs"
       }
     }

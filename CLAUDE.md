@@ -10,7 +10,7 @@ bun run build        # Compile TypeScript → lib/
 bun run clean        # Remove compiled output
 bun run test         # Run tests (mocha)
 sf plugins link .    # Link plugin for local testing
-sf fileorg migrate   # Run the plugin (after linking)
+sf filebuddy migrate   # Run the plugin (after linking)
 ```
 
 ## Architecture
@@ -19,12 +19,12 @@ This is a Salesforce CLI (`sf`) plugin built on oclif with `@salesforce/sf-plugi
 
 ### Dual-Mode Design
 
-- **Flag mode:** `sf fileorg migrate --source-org X --target-org Y --object Account --match-field Name --dry-run` — all four required flags provided, executes immediately.
-- **Interactive mode:** `sf fileorg migrate` — missing flags trigger the inquirer-based menu loop with org selection, object/field autocomplete, and migration configuration.
+- **Flag mode:** `sf filebuddy migrate --source-org X --target-org Y --object Account --match-field Name --dry-run` — all four required flags provided, executes immediately.
+- **Interactive mode:** `sf filebuddy migrate` — missing flags trigger the inquirer-based menu loop with org selection, object/field autocomplete, and migration configuration.
 
 ### Module Responsibilities
 
-- **src/commands/fileorg/migrate.ts** — oclif command class. Parses flags, detects mode (flag vs interactive), wires up the `MigrationLogger`, delegates to either direct execution or the interactive menu.
+- **src/commands/filebuddy/migrate.ts** — oclif command class. Parses flags, detects mode (flag vs interactive), wires up the `MigrationLogger`, delegates to either direct execution or the interactive menu.
 
 - **src/lib/migration.ts** — The 8-step migration pipeline: query source records → find ContentDocumentLinks → get ContentVersion metadata → map records to target via match field → download binaries → upload as base64 ContentVersions → resolve new ContentDocumentIds → create ContentDocumentLinks. All display output goes through a `MigrationLogger` interface, keeping this module decoupled from oclif. Uses `Connection` from `@salesforce/core` (jsforce v3 under the hood).
 

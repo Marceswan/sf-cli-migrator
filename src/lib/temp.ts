@@ -2,7 +2,7 @@ import os from 'node:os';
 import path from 'node:path';
 import fs from 'fs-extra';
 
-const TEMP_BASE = path.join(os.tmpdir(), 'sf-fileorg-migrate');
+const TEMP_BASE = path.join(os.tmpdir(), 'sf-filebuddy-migrate');
 
 export function createTempDirPath(): string {
   return path.join(TEMP_BASE, Date.now().toString());

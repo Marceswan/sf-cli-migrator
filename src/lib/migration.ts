@@ -21,7 +21,8 @@ export interface MigrationOptions {
   sourceConn: Connection;
   targetConn: Connection;
   objectApiName: string;
-  matchField: string;
+  sourceMatchField: string;
+  targetMatchField: string;
   whereClause?: string;
   dryRun?: boolean;
   logger: MigrationLogger;
@@ -58,7 +59,8 @@ export async function runMigration(options: MigrationOptions): Promise<Migration
     sourceConn,
     targetConn,
     objectApiName,
-    matchField,
+    sourceMatchField,
+    targetMatchField,
     whereClause,
     dryRun = false,
     logger,
@@ -80,9 +82,13 @@ export async function runMigration(options: MigrationOptions): Promise<Migration
     logger.startSpinner('Querying source records...');
 
     const where = whereClause ? ` WHERE ${whereClause}` : '';
+    // If sourceMatchField is Id, no need to add it to SELECT (it's always included)
+    const sourceSelectFields = sourceMatchField === 'Id'
+      ? 'Id'
+      : `Id, ${sourceMatchField}`;
     const sourceRecords = await queryAll(
       sourceConn,
-      `SELECT Id, ${matchField} FROM ${objectApiName}${where}`
+      `SELECT ${sourceSelectFields} FROM ${objectApiName}${where}`
     );
 
     if (sourceRecords.length === 0) {
@@ -156,41 +162,44 @@ export async function runMigration(options: MigrationOptions): Promise<Migration
     // ─── Step 4: Build the target record ID map ───────────────────────────
     logger.startSpinner('Mapping records in target org...');
 
-    // Get match field values from source
-    const sourceMatchMap = new Map<string, unknown>();
-    for (const rec of sourceRecords) {
-      sourceMatchMap.set(rec.Id as string, rec[matchField]);
-    }
-
-    // Query target records by match field
-    const matchValues = [
+    // Get source match field values (e.g., source.Id or source.External_Id__c)
+    const sourceMatchValues = [
       ...new Set(
         sourceRecords
-          .map((r) => r[matchField])
+          .map((r) => r[sourceMatchField])
           .filter(Boolean)
           .map(String)
       ),
     ];
+
+    // Build source record Id -> source match value map
+    const sourceIdToMatchValue = new Map<string, string>();
+    for (const rec of sourceRecords) {
+      const val = rec[sourceMatchField];
+      if (val) sourceIdToMatchValue.set(rec.Id as string, String(val));
+    }
+
+    // Query target records where targetMatchField matches source values
     const targetRecords = await queryAllChunked(
       targetConn,
-      matchValues,
+      sourceMatchValues,
       (chunk) =>
-        `SELECT Id, ${matchField} FROM ${objectApiName}
-         WHERE ${matchField} IN (${chunk.map((v) => `'${escSoql(v)}'`).join(',')})`
+        `SELECT Id, ${targetMatchField} FROM ${objectApiName}
+         WHERE ${targetMatchField} IN (${chunk.map((v) => `'${escSoql(v)}'`).join(',')})`
     );
 
     // Build target match value -> target Id map
     const targetMatchToId = new Map<string, string>();
     for (const rec of targetRecords) {
-      targetMatchToId.set(String(rec[matchField]), rec.Id as string);
+      targetMatchToId.set(String(rec[targetMatchField]), rec.Id as string);
     }
 
     // Build source entity Id -> target entity Id map
     const sourceToTargetEntityMap = new Map<string, string>();
     let unmatchedCount = 0;
     for (const rec of sourceRecords) {
-      const matchVal = String(rec[matchField]);
-      if (targetMatchToId.has(matchVal)) {
+      const matchVal = sourceIdToMatchValue.get(rec.Id as string);
+      if (matchVal && targetMatchToId.has(matchVal)) {
         sourceToTargetEntityMap.set(rec.Id as string, targetMatchToId.get(matchVal)!);
       } else {
         unmatchedCount++;
@@ -354,8 +363,9 @@ export async function runMigration(options: MigrationOptions): Promise<Migration
       await cleanupTempDir(tempDir);
     }
   } catch (err) {
+    logger.stopSpinnerFail('Error');
     results.errors.push({ stage: 'fatal', error: (err as Error).message });
-    logger.warn(`Fatal error: ${(err as Error).message}`);
+    logger.log(`\n  Fatal error: ${(err as Error).message}\n`);
     if (tempDir) {
       await cleanupTempDir(tempDir);
     }

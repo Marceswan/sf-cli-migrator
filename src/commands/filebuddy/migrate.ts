@@ -6,7 +6,7 @@ import { runMigration, MigrationLogger, MigrationResults } from '../../lib/migra
 import { runInteractive } from '../../lib/interactive.js';
 
 Messages.importMessagesDirectoryFromMetaUrl(import.meta.url);
-const messages = Messages.loadMessages('sf-cli-migrator', 'fileorg.migrate');
+const messages = Messages.loadMessages('sf-cli-migrator', 'filebuddy.migrate');
 
 export default class Migrate extends SfCommand<MigrationResults | void> {
   public static readonly summary = messages.getMessage('summary');
@@ -31,6 +31,9 @@ export default class Migrate extends SfCommand<MigrationResults | void> {
     'match-field': Flags.string({
       char: 'm',
       summary: messages.getMessage('flags.match-field.summary'),
+    }),
+    'target-match-field': Flags.string({
+      summary: messages.getMessage('flags.target-match-field.summary'),
     }),
     where: Flags.string({
       char: 'w',
@@ -65,12 +68,16 @@ export default class Migrate extends SfCommand<MigrationResults | void> {
       const sourceConn = flags['source-org']!.getConnection();
       const targetConn = flags['target-org']!.getConnection();
 
+      const sourceMatchField = flags['match-field']!;
+      const targetMatchField = flags['target-match-field'] ?? sourceMatchField;
+
       const startTime = Date.now();
       const results = await runMigration({
         sourceConn,
         targetConn,
         objectApiName: flags.object!,
-        matchField: flags['match-field']!,
+        sourceMatchField,
+        targetMatchField,
         whereClause: flags.where,
         dryRun: flags['dry-run'],
         logger,

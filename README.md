@@ -8,7 +8,7 @@ Built on [oclif](https://oclif.io/) and [`@salesforce/sf-plugins-core`](https://
 
 1. **Connect two orgs** — uses your existing `sf` CLI authenticated sessions (zero additional setup)
 2. **Pick an object** (Account, Case, Opportunity, Custom_Object__c, etc.)
-3. **Choose a match field** to map records between orgs (External ID, Name, CaseNumber, etc.)
+3. **Choose match fields** to map records between orgs — same field on both, or different fields (e.g., source `Id` → target `Legacy_Id__c`)
 4. The plugin automatically:
    - Queries all ContentDocumentLinks for your records in the source org
    - Downloads the file binaries
@@ -40,7 +40,7 @@ sf plugins link .
 ### Verify Installation
 
 ```bash
-sf fileorg migrate --help
+sf filebuddy migrate --help
 ```
 
 ## Usage
@@ -52,7 +52,7 @@ The plugin supports two modes: **interactive** (menu-driven) and **flag-driven**
 Run the command with no flags to launch the interactive menu:
 
 ```bash
-sf fileorg migrate
+sf filebuddy migrate
 ```
 
 You'll see:
@@ -86,7 +86,7 @@ The menu guides you through connecting orgs, selecting an object, choosing a mat
 Provide all four required flags for direct, scriptable execution:
 
 ```bash
-sf fileorg migrate \
+sf filebuddy migrate \
   --source-org my-source \
   --target-org my-target \
   --object Account \
@@ -100,18 +100,37 @@ sf fileorg migrate \
 | `--source-org` | `-s` | For flag mode | Org to migrate files FROM (username or alias) |
 | `--target-org` | `-t` | For flag mode | Org to migrate files TO (username or alias) |
 | `--object` | `-o` | For flag mode | Source object API name (e.g., `Account`, `Case`) |
-| `--match-field` | `-m` | For flag mode | Field to match records between orgs (e.g., `External_Id__c`, `Name`) |
+| `--match-field` | `-m` | For flag mode | Field on the source org to match records (e.g., `Id`, `External_Id__c`, `Name`). Used on both orgs unless `--target-match-field` is also provided. |
+| `--target-match-field` | | No | Field on the target org to match against source values. Defaults to `--match-field` if omitted. |
 | `--where` | `-w` | No | SOQL WHERE clause to filter source records |
 | `--dry-run` | `-d` | No | Preview what would be migrated without making changes |
 
 If any of the four "required" flags are omitted, the plugin falls into interactive mode (pre-filling whichever flags were provided).
 
-### Examples
+### Record Matching
 
-Dry run — preview Account file migration using an external ID:
+By default, `--match-field` is used on **both** orgs. If the source and target use different field names to identify the same records, provide both:
 
 ```bash
-sf fileorg migrate \
+# Source org uses standard Id, target org stores it in Legacy_Id__c
+sf filebuddy migrate \
+  --source-org old-prod \
+  --target-org new-prod \
+  --object Account \
+  --match-field Id \
+  --target-match-field Legacy_Id__c
+```
+
+The plugin queries `SELECT Id FROM Account` on the source, then `SELECT Id, Legacy_Id__c FROM Account WHERE Legacy_Id__c IN (...)` on the target to build the record mapping.
+
+In interactive mode, after choosing the source match field you'll be asked: *"Use a different field on the target org?"* — selecting yes gives you autocomplete for the target org's fields.
+
+### Examples
+
+Same field on both orgs (External ID):
+
+```bash
+sf filebuddy migrate \
   --source-org sandbox \
   --target-org prod \
   --object Account \
@@ -119,10 +138,21 @@ sf fileorg migrate \
   --dry-run
 ```
 
-Migrate Case files created after a specific date:
+Source Id → target Legacy_Id__c (asymmetric match):
 
 ```bash
-sf fileorg migrate \
+sf filebuddy migrate \
+  --source-org old-prod \
+  --target-org new-prod \
+  --object Account \
+  --match-field Id \
+  --target-match-field Legacy_Id__c
+```
+
+Filter by SOQL WHERE clause:
+
+```bash
+sf filebuddy migrate \
   --source-org sandbox \
   --target-org prod \
   --object Case \
@@ -130,10 +160,10 @@ sf fileorg migrate \
   --where "CreatedDate >= 2024-01-01T00:00:00Z"
 ```
 
-Migrate files for a custom object, filtered by owner:
+Custom object with owner filter:
 
 ```bash
-sf fileorg migrate \
+sf filebuddy migrate \
   --source-org dev \
   --target-org staging \
   --object Equipment_Rental__c \
@@ -144,7 +174,7 @@ sf fileorg migrate \
 Interactive mode with source org pre-filled:
 
 ```bash
-sf fileorg migrate --source-org my-sandbox
+sf filebuddy migrate --source-org my-sandbox
 ```
 
 ### Filtering Records
@@ -172,10 +202,10 @@ Omit the flag to migrate files for all records of the selected object.
 
 The migration runs in 8 steps:
 
-1. **Query source records** — `SELECT Id, {matchField} FROM {object}` with optional WHERE filter
+1. **Query source records** — `SELECT Id, {sourceMatchField} FROM {object}` with optional WHERE filter
 2. **Find ContentDocumentLinks** — Identifies all files attached to the source records
 3. **Fetch ContentVersion metadata** — Gets file details (title, size, extension) for the latest version of each document
-4. **Map records to target** — Queries the target org for records matching by the chosen field and builds a source-to-target ID map
+4. **Map records to target** — Queries the target org using `{targetMatchField}` to match against source values and builds a source-to-target ID map
 5. **Download files** — Downloads file binaries from the source org to a temp directory
 6. **Upload files** — Uploads each file as a new ContentVersion (base64) in the target org
 7. **Resolve new ContentDocumentIds** — Queries back the newly created ContentVersions to get their ContentDocumentIds
@@ -201,7 +231,7 @@ npm run clean        # Remove compiled output
 ### Link for Testing
 
 ```bash
-sf plugins link .    # After building, makes `sf fileorg migrate` available
+sf plugins link .    # After building, makes `sf filebuddy migrate` available
 ```
 
 ### Project Structure
