@@ -210,15 +210,17 @@ async function executeMigration(
     await saveState(stateId, currentState);
   }
 
-  // SIGINT handler — cooperative abort
+  // SIGINT handler — remove framework handlers so we can do cooperative shutdown
   let aborted = false;
+  const existingSigintListeners = process.listeners('SIGINT');
+  process.removeAllListeners('SIGINT');
   const sigintHandler = (): void => {
     if (aborted) {
       console.log(chalk.red('\n  Force quit.'));
       process.exit(1);
     }
     aborted = true;
-    console.log(chalk.yellow('\n  Ctrl+C detected — finishing current file and saving progress...'));
+    console.log(chalk.yellow('\n  Ctrl+C detected — finishing current batch and saving progress...'));
   };
   process.on('SIGINT', sigintHandler);
 
@@ -264,6 +266,9 @@ async function executeMigration(
     }
   } finally {
     process.removeListener('SIGINT', sigintHandler);
+    for (const listener of existingSigintListeners) {
+      process.on('SIGINT', listener as NodeJS.SignalsListener);
+    }
   }
 }
 

@@ -118,15 +118,18 @@ export default class Migrate extends SfCommand<MigrationResults | void> {
         currentState = createState(stateId, stateConfig);
       }
 
-      // SIGINT handler
+      // SIGINT handler — remove SfCommand's default handler (which throws ExitError)
+      // so we can do a cooperative shutdown instead
       let aborted = false;
+      const existingSigintListeners = process.listeners('SIGINT');
+      process.removeAllListeners('SIGINT');
       const sigintHandler = (): void => {
         if (aborted) {
           this.log(chalk.red('\n  Force quit.'));
           process.exit(1);
         }
         aborted = true;
-        this.log(chalk.yellow('\n  Ctrl+C detected — finishing current file and saving progress...'));
+        this.log(chalk.yellow('\n  Ctrl+C detected — finishing current batch and saving progress...'));
       };
       process.on('SIGINT', sigintHandler);
 
@@ -179,6 +182,10 @@ export default class Migrate extends SfCommand<MigrationResults | void> {
         return results;
       } finally {
         process.removeListener('SIGINT', sigintHandler);
+        // Restore SfCommand's original SIGINT listeners
+        for (const listener of existingSigintListeners) {
+          process.on('SIGINT', listener as NodeJS.SignalsListener);
+        }
       }
     } else {
       // ── Interactive mode: launch menu ────────────────────────────────────
