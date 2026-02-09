@@ -250,6 +250,8 @@ export async function runMigration(options: MigrationOptions): Promise<Migration
 
     const sourceDocToTargetDoc = new Map<string, string>();
     const uploadedVersionIds: string[] = [];
+    // Track which uploaded ContentVersion maps to which source ContentDocumentId
+    const uploadedVersionToSourceDoc = new Map<string, string>();
 
     for (let i = 0; i < downloadedFiles.length; i++) {
       const file = downloadedFiles[i];
@@ -269,6 +271,7 @@ export async function runMigration(options: MigrationOptions): Promise<Migration
         if (insertResult.success) {
           results.filesUploaded++;
           uploadedVersionIds.push(insertResult.id);
+          uploadedVersionToSourceDoc.set(insertResult.id, file.ContentDocumentId);
         } else {
           throw new Error(insertResult.errors?.join(', ') || 'Unknown insert error');
         }
@@ -289,22 +292,25 @@ export async function runMigration(options: MigrationOptions): Promise<Migration
         targetConn,
         uploadedVersionIds,
         (chunk) =>
-          `SELECT Id, ContentDocumentId, Title, PathOnClient
+          `SELECT Id, ContentDocumentId
            FROM ContentVersion
            WHERE Id IN (${chunk.map((id) => `'${id}'`).join(',')})`
       );
 
       for (const nv of newVersions) {
-        const matchingSource = downloadedFiles.find(
-          (f) => f.Title === (nv.Title as string) && f.PathOnClient === (nv.PathOnClient as string)
-        );
-        if (matchingSource) {
-          sourceDocToTargetDoc.set(matchingSource.ContentDocumentId, nv.ContentDocumentId as string);
+        const sourceDocId = uploadedVersionToSourceDoc.get(nv.Id as string);
+        if (sourceDocId) {
+          sourceDocToTargetDoc.set(sourceDocId, nv.ContentDocumentId as string);
         }
       }
     }
 
     logger.stopSpinner(`Resolved ${sourceDocToTargetDoc.size} document ID mappings.`);
+
+    if (sourceDocToTargetDoc.size === 0 && uploadedVersionIds.length > 0) {
+      logger.warn('No document ID mappings resolved — ContentDocumentLinks cannot be created.');
+      logger.warn(`  Uploaded ${uploadedVersionIds.length} files but could not resolve their ContentDocumentIds.`);
+    }
 
     // ─── Step 8: Create ContentDocumentLinks in target ────────────────────
     logger.startSpinner('Creating ContentDocumentLinks in target...');
@@ -357,6 +363,13 @@ export async function runMigration(options: MigrationOptions): Promise<Migration
     }
 
     logger.stopSpinner(`Created ${results.linksCreated} ContentDocumentLinks.`);
+
+    if (results.linksCreated === 0 && results.filesUploaded > 0) {
+      logger.warn('Files were uploaded but no ContentDocumentLinks were created.');
+      logger.warn(`  Source-to-target record mappings: ${sourceToTargetEntityMap.size}`);
+      logger.warn(`  Source-to-target document mappings: ${sourceDocToTargetDoc.size}`);
+      logger.warn(`  Links attempted: ${linksToCreate.length}`);
+    }
 
     // ─── Cleanup ──────────────────────────────────────────────────────────
     if (tempDir) {
