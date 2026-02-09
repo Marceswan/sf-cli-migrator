@@ -245,13 +245,12 @@ export async function runMigration(options: MigrationOptions): Promise<Migration
 
     logger.stopSpinner(`Downloaded ${downloadedFiles.length} files.`);
 
-    // ─── Step 6: Upload ContentVersions to target ─────────────────────────
+    // ─── Step 6: Upload ContentVersions and resolve ContentDocumentIds ────
     logger.startSpinner('Uploading files to target org...');
 
     const sourceDocToTargetDoc = new Map<string, string>();
-    const uploadedVersionIds: string[] = [];
-    // Track which uploaded ContentVersion maps to which source ContentDocumentId
-    const uploadedVersionToSourceDoc = new Map<string, string>();
+    // Collect version IDs per batch for periodic resolution
+    let pendingUploads: Array<{ versionId: string; sourceDocId: string }> = [];
 
     for (let i = 0; i < downloadedFiles.length; i++) {
       const file = downloadedFiles[i];
@@ -270,8 +269,10 @@ export async function runMigration(options: MigrationOptions): Promise<Migration
 
         if (insertResult.success) {
           results.filesUploaded++;
-          uploadedVersionIds.push(insertResult.id);
-          uploadedVersionToSourceDoc.set(insertResult.id, file.ContentDocumentId);
+          const versionId = insertResult.id;
+          if (versionId) {
+            pendingUploads.push({ versionId, sourceDocId: file.ContentDocumentId });
+          }
         } else {
           throw new Error(insertResult.errors?.join(', ') || 'Unknown insert error');
         }
@@ -280,36 +281,18 @@ export async function runMigration(options: MigrationOptions): Promise<Migration
         results.errors.push({ file: file.Title, stage: 'upload', error: (err as Error).message });
         logger.warn(`Failed to upload: ${file.Title} — ${(err as Error).message}`);
       }
-    }
 
-    logger.stopSpinner(`Uploaded ${results.filesUploaded} files to target.`);
-
-    // ─── Step 7: Query back new ContentDocumentIds ────────────────────────
-    logger.startSpinner('Resolving new ContentDocument IDs...');
-
-    if (uploadedVersionIds.length > 0) {
-      const newVersions = await queryAllChunked(
-        targetConn,
-        uploadedVersionIds,
-        (chunk) =>
-          `SELECT Id, ContentDocumentId
-           FROM ContentVersion
-           WHERE Id IN (${chunk.map((id) => `'${id}'`).join(',')})`
-      );
-
-      for (const nv of newVersions) {
-        const sourceDocId = uploadedVersionToSourceDoc.get(nv.Id as string);
-        if (sourceDocId) {
-          sourceDocToTargetDoc.set(sourceDocId, nv.ContentDocumentId as string);
-        }
+      // Resolve ContentDocumentIds every BATCH_SIZE uploads (or at the end)
+      if (pendingUploads.length >= BATCH_SIZE || (i === downloadedFiles.length - 1 && pendingUploads.length > 0)) {
+        await resolveContentDocumentIds(targetConn, pendingUploads, sourceDocToTargetDoc);
+        pendingUploads = [];
       }
     }
 
-    logger.stopSpinner(`Resolved ${sourceDocToTargetDoc.size} document ID mappings.`);
+    logger.stopSpinner(`Uploaded ${results.filesUploaded} files. Resolved ${sourceDocToTargetDoc.size} document IDs.`);
 
-    if (sourceDocToTargetDoc.size === 0 && uploadedVersionIds.length > 0) {
+    if (sourceDocToTargetDoc.size === 0 && results.filesUploaded > 0) {
       logger.warn('No document ID mappings resolved — ContentDocumentLinks cannot be created.');
-      logger.warn(`  Uploaded ${uploadedVersionIds.length} files but could not resolve their ContentDocumentIds.`);
     }
 
     // ─── Step 8: Create ContentDocumentLinks in target ────────────────────
@@ -421,6 +404,41 @@ async function queryAllChunked(
     allRecords.push(...records);
   }
   return allRecords;
+}
+
+async function resolveContentDocumentIds(
+  conn: Connection,
+  uploads: Array<{ versionId: string; sourceDocId: string }>,
+  resultMap: Map<string, string>
+): Promise<void> {
+  if (uploads.length === 0) return;
+
+  const idToSourceDoc = new Map<string, string>();
+  for (const u of uploads) {
+    idToSourceDoc.set(u.versionId, u.sourceDocId);
+  }
+
+  // Use direct REST API call to query ContentDocumentIds — bypasses jsforce Query object
+  const ids = uploads.map((u) => u.versionId);
+  const soql = `SELECT Id, ContentDocumentId FROM ContentVersion WHERE Id IN (${ids.map((id) => `'${id}'`).join(',')})`;
+  const apiVersion = conn.getApiVersion();
+  const url = `${conn.instanceUrl}/services/data/v${apiVersion}/query?q=${encodeURIComponent(soql)}`;
+
+  const response = await fetch(url, {
+    headers: { Authorization: `Bearer ${conn.accessToken!}` },
+  });
+
+  if (!response.ok) {
+    throw new Error(`ContentDocumentId resolution query failed: ${response.status} ${response.statusText}`);
+  }
+
+  const data = (await response.json()) as { records: Array<{ Id: string; ContentDocumentId: string }> };
+  for (const rec of data.records) {
+    const sourceDocId = idToSourceDoc.get(rec.Id);
+    if (sourceDocId) {
+      resultMap.set(sourceDocId, rec.ContentDocumentId);
+    }
+  }
 }
 
 async function downloadContentVersion(
