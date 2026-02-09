@@ -14,6 +14,17 @@ export async function prepareTempDir(): Promise<string> {
   return tempDir;
 }
 
+/**
+ * Prepare a stable temp dir scoped to a stateId.
+ * Unlike prepareTempDir(), this returns a deterministic path so files
+ * persist across runs for resume support.
+ */
+export async function prepareTempDirForState(stateId: string): Promise<string> {
+  const tempDir = path.join(TEMP_BASE, stateId);
+  await fs.ensureDir(tempDir);
+  return tempDir;
+}
+
 export async function cleanupTempDir(tempDir: string): Promise<void> {
   if (await fs.pathExists(tempDir)) {
     await fs.remove(tempDir);

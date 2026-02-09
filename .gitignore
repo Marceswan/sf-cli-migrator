@@ -1,5 +1,6 @@
 node_modules/
 /lib/
 temp/
+.state/
 *.tsbuildinfo
 oclif.manifest.json

@@ -104,6 +104,7 @@ sf filebuddy migrate \
 | `--target-match-field` | | No | Field on the target org to match against source values. Defaults to `--match-field` if omitted. |
 | `--where` | `-w` | No | SOQL WHERE clause to filter source records |
 | `--dry-run` | `-d` | No | Preview what would be migrated without making changes |
+| `--resume` | `-r` | No | Resume a previously paused or failed migration |
 
 If any of the four "required" flags are omitted, the plugin falls into interactive mode (pre-filling whichever flags were provided).
 
@@ -190,6 +191,52 @@ Name LIKE 'ACME%'
 
 Omit the flag to migrate files for all records of the selected object.
 
+## Pause & Resume
+
+Large migrations can be paused (Ctrl+C), survive crashes, or hit API limits and resume where they left off. Progress is saved automatically after each batch of 200 files.
+
+### How It Works
+
+- Files are processed in batches of 200: download → upload → resolve IDs → save progress → clean up local files
+- SOQL queries (Steps 1-4) always re-run fresh on resume — they're fast and idempotent
+- Completed file uploads are tracked and skipped on resume
+- ContentDocumentLink creation (Step 8) deduplicates against existing links in the target org
+
+### Flag Mode
+
+```bash
+# Start a migration (state is automatically tracked)
+sf filebuddy migrate \
+  --source-org my-source \
+  --target-org my-target \
+  --object Account \
+  --match-field External_Id__c
+
+# Press Ctrl+C to pause — progress is saved automatically
+# Resume from where you left off:
+sf filebuddy migrate \
+  --source-org my-source \
+  --target-org my-target \
+  --object Account \
+  --match-field External_Id__c \
+  --resume
+```
+
+### Interactive Mode
+
+When saved migration states exist, the main menu shows a **Resume Migration** option. Selecting it lists saved migrations with their progress, lets you pick one, and resumes from where it left off.
+
+When starting a new migration that matches an existing saved state, you'll be prompted to either resume or start fresh.
+
+### SIGINT Handling
+
+- **First Ctrl+C**: Finishes the current batch, saves progress, and exits gracefully
+- **Second Ctrl+C**: Force quits immediately (may lose up to one batch of progress)
+
+### State Files
+
+State files are stored in the OS temp directory (`$TMPDIR/sf-filebuddy-migrate/.state/`) and are automatically cleaned up when a migration completes successfully. They contain a deterministic ID based on the migration config (object, match fields, orgs, WHERE clause), so the same configuration always maps to the same state file.
+
 ## Limitations
 
 - **10 MB per file** — Files larger than 10 MB are flagged and skipped (Salesforce REST API limit). They appear in the summary as skipped files.
@@ -238,10 +285,11 @@ sf plugins link .    # After building, makes `sf filebuddy migrate` available
 
 ```
 src/
-├── commands/fileorg/migrate.ts   # oclif command class (flag parsing, dual-mode routing)
+├── commands/filebuddy/migrate.ts # oclif command class (flag parsing, dual-mode routing)
 ├── lib/
-│   ├── migration.ts              # 8-step migration pipeline
+│   ├── migration.ts              # 8-step migration pipeline (batch download/upload)
 │   ├── interactive.ts            # Inquirer-based interactive menu
+│   ├── state.ts                  # Migration state persistence (pause/resume)
 │   └── temp.ts                   # Temp directory management
 └── index.ts                      # Plugin export
 ```

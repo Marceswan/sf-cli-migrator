@@ -3,6 +3,17 @@ import autocompletePrompt from 'inquirer-autocomplete-prompt';
 import chalk from 'chalk';
 import { AuthInfo, Connection, Org, OrgAuthorization } from '@salesforce/core';
 import { runMigration, MigrationLogger, MigrationResults, formatBytes } from './migration.js';
+import {
+  generateStateId,
+  loadState,
+  saveState,
+  deleteState,
+  createState,
+  listStates,
+  MigrationState,
+  MigrationStateConfig,
+} from './state.js';
+import { cleanupTempDir } from './temp.js';
 
 inquirer.registerPrompt('autocomplete', autocompletePrompt);
 
@@ -164,6 +175,96 @@ async function getAllObjects(conn: Connection): Promise<ObjectInfo[]> {
       label: o.label,
       custom: o.custom,
     }));
+}
+
+// ─── Execute Migration (with SIGINT + state) ───────────────────────────────
+
+async function executeMigration(
+  config: {
+    objectApiName: string;
+    sourceMatchField: string;
+    targetMatchField: string;
+    whereClause?: string;
+    dryRun: boolean;
+  },
+  logger: MigrationLogger,
+  existingState: MigrationState | null = null,
+): Promise<void> {
+  if (!sourceConn || !targetConn) return;
+
+  const stateConfig: MigrationStateConfig = {
+    objectApiName: config.objectApiName,
+    sourceMatchField: config.sourceMatchField,
+    targetMatchField: config.targetMatchField,
+    whereClause: config.whereClause ?? null,
+    sourceInstanceUrl: sourceConn.instanceUrl,
+    targetInstanceUrl: targetConn.instanceUrl,
+  };
+  const stateId = generateStateId(stateConfig);
+
+  let currentState = existingState ?? createState(stateId, stateConfig);
+
+  // Don't track state for dry runs
+  if (!config.dryRun) {
+    currentState.status = 'in_progress';
+    await saveState(stateId, currentState);
+  }
+
+  // SIGINT handler — cooperative abort
+  let aborted = false;
+  const sigintHandler = (): void => {
+    if (aborted) {
+      console.log(chalk.red('\n  Force quit.'));
+      process.exit(1);
+    }
+    aborted = true;
+    console.log(chalk.yellow('\n  Ctrl+C detected — finishing current file and saving progress...'));
+  };
+  process.on('SIGINT', sigintHandler);
+
+  const onProgress = config.dryRun ? null : (update: { completed: Record<string, string>; stats: Record<string, number> }): void => {
+    Object.assign(currentState.completed, update.completed);
+    Object.assign(currentState.stats, update.stats);
+    saveState(stateId, currentState).catch(() => {});
+  };
+
+  const startTime = Date.now();
+
+  try {
+    const results = await runMigration({
+      sourceConn,
+      targetConn,
+      objectApiName: config.objectApiName,
+      sourceMatchField: config.sourceMatchField,
+      targetMatchField: config.targetMatchField,
+      whereClause: config.whereClause,
+      dryRun: config.dryRun,
+      logger,
+      state: existingState,
+      onProgress,
+      shouldAbort: () => aborted,
+      stateId,
+    });
+
+    const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+    displayResults(results, elapsed);
+
+    // Post-migration state handling (skip for dry runs)
+    if (!config.dryRun) {
+      if (aborted) {
+        currentState.status = 'paused';
+        Object.assign(currentState.stats, results);
+        await saveState(stateId, currentState);
+        console.log(chalk.yellow('  Progress saved. Use "Resume Migration" to continue.\n'));
+      } else {
+        await deleteState(stateId);
+        await cleanupTempDir(currentState.tempDir);
+        console.log(chalk.green('  Migration complete — state cleaned up.\n'));
+      }
+    }
+  } finally {
+    process.removeListener('SIGINT', sigintHandler);
+  }
 }
 
 // ─── Start Migration Flow ───────────────────────────────────────────────────
@@ -333,6 +434,44 @@ async function startMigration(logger: MigrationLogger): Promise<void> {
     },
   ]);
 
+  // Check for existing state matching this config
+  let existingState: MigrationState | null = null;
+  if (!dryRun && sourceConn && targetConn) {
+    const stateConfig: MigrationStateConfig = {
+      objectApiName,
+      sourceMatchField,
+      targetMatchField,
+      whereClause: whereClause || null,
+      sourceInstanceUrl: sourceConn.instanceUrl,
+      targetInstanceUrl: targetConn.instanceUrl,
+    };
+    const stateId = generateStateId(stateConfig);
+    existingState = await loadState(stateId);
+
+    if (existingState) {
+      const uploaded = Object.keys(existingState.completed).length;
+      console.log(chalk.yellow(`\n  Previous migration state found: ${uploaded} files already uploaded.`));
+
+      const { resumeChoice } = await inquirer.prompt([
+        {
+          type: 'list',
+          name: 'resumeChoice',
+          message: 'What would you like to do?',
+          choices: [
+            { name: `Resume from where you left off (${uploaded} files done)`, value: 'resume' },
+            { name: 'Start fresh (discard previous progress)', value: 'fresh' },
+          ],
+        },
+      ]);
+
+      if (resumeChoice === 'fresh') {
+        await deleteState(stateId);
+        await cleanupTempDir(existingState.tempDir);
+        existingState = null;
+      }
+    }
+  }
+
   const matchDisplay = sourceMatchField === targetMatchField
     ? sourceMatchField
     : `${sourceMatchField} → ${targetMatchField}`;
@@ -344,6 +483,9 @@ async function startMigration(logger: MigrationLogger): Promise<void> {
   console.log(`  Mode:        ${dryRun ? 'DRY RUN (preview)' : chalk.yellow('LIVE — will write to target')}`);
   console.log(`  Source:      ${sourceLabel}`);
   console.log(`  Target:      ${targetLabel}`);
+  if (existingState) {
+    console.log(`  Resume:      ${chalk.green(`Yes — ${Object.keys(existingState.completed).length} files previously completed`)}`);
+  }
   console.log(chalk.cyan('  ─────────────────────────────\n'));
 
   const { confirmed } = await inquirer.prompt([
@@ -363,20 +505,102 @@ async function startMigration(logger: MigrationLogger): Promise<void> {
   }
 
   console.log('');
-  const startTime = Date.now();
-  const results = await runMigration({
-    sourceConn,
-    targetConn,
-    objectApiName,
-    sourceMatchField,
-    targetMatchField,
-    whereClause: whereClause || undefined,
-    dryRun,
+  await executeMigration(
+    { objectApiName, sourceMatchField, targetMatchField, whereClause: whereClause || undefined, dryRun },
     logger,
-  });
-  const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+    existingState,
+  );
+}
 
-  displayResults(results, elapsed);
+// ─── Resume Migration ────────────────────────────────────────────────────────
+
+async function resumeMigration(logger: MigrationLogger): Promise<void> {
+  if (!sourceConn || !targetConn) {
+    console.log(chalk.red('\n  Both source and target orgs must be connected first.\n'));
+    return;
+  }
+
+  const states = await listStates();
+  const resumeable = states.filter((s) => s.status !== 'completed');
+
+  if (resumeable.length === 0) {
+    console.log(chalk.yellow('\n  No saved migration states found.\n'));
+    return;
+  }
+
+  const choices = resumeable.map((s) => ({
+    name: `${s.config.objectApiName} (${s.config.sourceMatchField}${s.config.sourceMatchField !== s.config.targetMatchField ? ` → ${s.config.targetMatchField}` : ''})` +
+      chalk.dim(` | ${s.stats?.filesUploaded ?? 0} uploaded | ${s.status} | ${s.updatedAt}`),
+    value: s.stateId,
+    short: s.stateId,
+  }));
+
+  const { selectedStateId } = await inquirer.prompt([
+    {
+      type: 'list',
+      name: 'selectedStateId',
+      message: 'Select a migration to resume:',
+      choices,
+    },
+  ]);
+
+  const stateData = await loadState(selectedStateId as string);
+  if (!stateData) {
+    console.log(chalk.red('\n  Could not load state file.\n'));
+    return;
+  }
+
+  // Verify connected orgs match the state config
+  if (sourceConn.instanceUrl !== stateData.config.sourceInstanceUrl ||
+      targetConn.instanceUrl !== stateData.config.targetInstanceUrl) {
+    console.log(chalk.red('\n  Connected orgs do not match the saved state:'));
+    console.log(chalk.red(`    State source: ${stateData.config.sourceInstanceUrl}`));
+    console.log(chalk.red(`    Connected:    ${sourceConn.instanceUrl}`));
+    console.log(chalk.red(`    State target: ${stateData.config.targetInstanceUrl}`));
+    console.log(chalk.red(`    Connected:    ${targetConn.instanceUrl}\n`));
+    return;
+  }
+
+  const completedCount = Object.keys(stateData.completed).length;
+  const matchDisplay = stateData.config.sourceMatchField === stateData.config.targetMatchField
+    ? stateData.config.sourceMatchField
+    : `${stateData.config.sourceMatchField} → ${stateData.config.targetMatchField}`;
+
+  console.log(chalk.cyan('\n  ── Resuming Migration ──'));
+  console.log(`  Object:      ${stateData.config.objectApiName}`);
+  console.log(`  Match:       ${matchDisplay}`);
+  console.log(`  Filter:      ${stateData.config.whereClause || '(all records)'}`);
+  console.log(`  Source:      ${sourceLabel}`);
+  console.log(`  Target:      ${targetLabel}`);
+  console.log(`  Progress:    ${chalk.green(`${completedCount} files already uploaded`)}`);
+  console.log(chalk.cyan('  ─────────────────────────\n'));
+
+  const { confirmed } = await inquirer.prompt([
+    {
+      type: 'confirm',
+      name: 'confirmed',
+      message: 'Resume this migration?',
+      default: true,
+    },
+  ]);
+
+  if (!confirmed) {
+    console.log(chalk.yellow('  Cancelled.\n'));
+    return;
+  }
+
+  console.log('');
+  await executeMigration(
+    {
+      objectApiName: stateData.config.objectApiName,
+      sourceMatchField: stateData.config.sourceMatchField,
+      targetMatchField: stateData.config.targetMatchField,
+      whereClause: stateData.config.whereClause ?? undefined,
+      dryRun: false,
+    },
+    logger,
+    stateData,
+  );
 }
 
 // ─── Display Results ────────────────────────────────────────────────────────
@@ -410,25 +634,41 @@ function displayResults(results: MigrationResults, elapsed: string): void {
 async function mainMenu(logger: MigrationLogger): Promise<void> {
   connectionStatus();
 
-  const { action } = await inquirer.prompt([
+  // Check for saved migration states to show resume option
+  const savedStates = await listStates();
+  const resumeableStates = savedStates.filter((s) => s.status !== 'completed');
+
+  const choices: Array<{ name: string; value: string } | inquirer.Separator> = [
+    { name: 'Connect Source Org (migrate FROM)', value: 'connect_source' },
+    { name: 'Connect Target Org (migrate TO)', value: 'connect_target' },
+    new inquirer.Separator(),
+    { name: 'Start Migration', value: 'migrate' },
+  ];
+
+  if (resumeableStates.length > 0) {
+    choices.push({
+      name: `Resume Migration (${resumeableStates.length} saved)`,
+      value: 'resume',
+    });
+  }
+
+  choices.push(
+    new inquirer.Separator(),
+    { name: 'Disconnect Source', value: 'disconnect_source' },
+    { name: 'Disconnect Target', value: 'disconnect_target' },
+    { name: 'Exit', value: 'exit' },
+  );
+
+  const { action: menuAction } = await inquirer.prompt([
     {
       type: 'list',
       name: 'action',
       message: 'What would you like to do?',
-      choices: [
-        { name: 'Connect Source Org (migrate FROM)', value: 'connect_source' },
-        { name: 'Connect Target Org (migrate TO)', value: 'connect_target' },
-        new inquirer.Separator(),
-        { name: 'Start Migration', value: 'migrate' },
-        new inquirer.Separator(),
-        { name: 'Disconnect Source', value: 'disconnect_source' },
-        { name: 'Disconnect Target', value: 'disconnect_target' },
-        { name: 'Exit', value: 'exit' },
-      ],
+      choices,
     },
   ]);
 
-  switch (action) {
+  switch (menuAction) {
     case 'connect_source':
       await connectOrg('source');
       break;
@@ -437,6 +677,9 @@ async function mainMenu(logger: MigrationLogger): Promise<void> {
       break;
     case 'migrate':
       await startMigration(logger);
+      break;
+    case 'resume':
+      await resumeMigration(logger);
       break;
     case 'disconnect_source':
       sourceConn = null;

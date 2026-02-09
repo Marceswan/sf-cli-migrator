@@ -30,7 +30,17 @@ This is a Salesforce CLI (`sf`) plugin built on oclif with `@salesforce/sf-plugi
 
 - **src/lib/interactive.ts** — Inquirer-based interactive menu loop. Lists orgs via `AuthInfo.listAllAuthorizations()`, connects via `Org.create()`, provides object/field autocomplete, gathers migration config, calls `runMigration()`, and displays results.
 
-- **src/lib/temp.ts** — Temp directory management using OS temp dir (`os.tmpdir()`). Timestamped subdirs for concurrent-run safety.
+- **src/lib/temp.ts** — Temp directory management using OS temp dir (`os.tmpdir()`). Supports both timestamped subdirs (concurrent-run safety) and deterministic state-scoped paths for resume support.
+
+- **src/lib/state.ts** — Migration state persistence for pause/resume. State files stored in `os.tmpdir()/sf-filebuddy-migrate/.state/`. Deterministic stateId from SHA-256 hash of migration config. Atomic writes (`.tmp` → rename) to prevent corruption on crash.
+
+### Pause & Resume Architecture
+
+- **Steps 1-4** (SOQL queries): Always re-run fresh — fast and idempotent.
+- **Steps 5-6** (download/upload): Processed in batches of 200. Download batch → upload batch → resolve ContentDocumentIds → save state → delete local files → next batch. Completed files tracked in `state.completed` map and skipped on resume.
+- **Step 8** (links): Queries existing ContentDocumentLinks in target before inserting to prevent duplicates.
+- **SIGINT handler**: First Ctrl+C sets cooperative abort flag (checked between batches), saves state. Second Ctrl+C force-quits.
+- **Temp dir**: Deterministic path tied to stateId, persists across runs for resume. Cleaned up only on successful completion.
 
 ### Key Constraints
 

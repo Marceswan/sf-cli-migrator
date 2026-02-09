@@ -1,7 +1,8 @@
 import path from 'node:path';
 import fs from 'fs-extra';
 import { Connection } from '@salesforce/core';
-import { prepareTempDir, cleanupTempDir } from './temp.js';
+import { prepareTempDir, prepareTempDirForState, cleanupTempDir } from './temp.js';
+import { MigrationState } from './state.js';
 
 const BATCH_SIZE = 200;
 const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10 MB REST API limit
@@ -17,6 +18,11 @@ export interface MigrationLogger {
   stopSpinnerFail: (msg: string) => void;
 }
 
+export interface ProgressUpdate {
+  completed: Record<string, string>;
+  stats: Omit<MigrationResults, 'errors'>;
+}
+
 export interface MigrationOptions {
   sourceConn: Connection;
   targetConn: Connection;
@@ -26,6 +32,14 @@ export interface MigrationOptions {
   whereClause?: string;
   dryRun?: boolean;
   logger: MigrationLogger;
+  /** Loaded migration state for resume (null = fresh run) */
+  state?: MigrationState | null;
+  /** Called after each batch with progress data for state persistence */
+  onProgress?: ((update: ProgressUpdate) => void) | null;
+  /** Returns true if migration should stop (e.g. Ctrl+C) */
+  shouldAbort?: (() => boolean) | null;
+  /** State ID for scoped temp directory */
+  stateId?: string | null;
 }
 
 export interface MigrationResults {
@@ -64,6 +78,10 @@ export async function runMigration(options: MigrationOptions): Promise<Migration
     whereClause,
     dryRun = false,
     logger,
+    state = null,
+    onProgress = null,
+    shouldAbort = null,
+    stateId = null,
   } = options;
 
   const results: MigrationResults = {
@@ -223,69 +241,111 @@ export async function runMigration(options: MigrationOptions): Promise<Migration
       return results;
     }
 
-    // ─── Step 5: Download files from source ───────────────────────────────
-    tempDir = await prepareTempDir();
-    logger.startSpinner('Downloading files from source...');
-
-    const downloadedFiles: DownloadedFile[] = [];
-    for (let i = 0; i < migrateableVersions.length; i++) {
-      const cv = migrateableVersions[i];
-      logger.updateSpinner(`Downloading files from source... (${i + 1}/${migrateableVersions.length}) ${cv.Title}`);
-
-      try {
-        const filePath = path.join(tempDir, `${cv.Id}_${cv.PathOnClient}`);
-        await downloadContentVersion(sourceConn, cv.Id, filePath);
-        downloadedFiles.push({ ...cv, localPath: filePath });
-      } catch (err) {
-        results.filesFailed++;
-        results.errors.push({ file: cv.Title, stage: 'download', error: (err as Error).message });
-        logger.warn(`Failed to download: ${cv.Title} — ${(err as Error).message}`);
-      }
-    }
-
-    logger.stopSpinner(`Downloaded ${downloadedFiles.length} files.`);
-
-    // ─── Step 6: Upload ContentVersions and resolve ContentDocumentIds ────
-    logger.startSpinner('Uploading files to target org...');
+    // ─── Steps 5-7: Download, upload, and resolve — in batches ─────────
+    // Process files in batches of BATCH_SIZE: download batch → upload batch →
+    // resolve IDs → save state → delete local files → next batch.
+    // This balances disk usage against API efficiency.
+    const completed: Record<string, string> = state ? { ...state.completed } : {};
+    tempDir = stateId ? await prepareTempDirForState(stateId) : await prepareTempDir();
+    logger.startSpinner('Migrating files...');
 
     const sourceDocToTargetDoc = new Map<string, string>();
-    // Collect version IDs per batch for periodic resolution
-    let pendingUploads: Array<{ versionId: string; sourceDocId: string }> = [];
+    let aborted = false;
 
-    for (let i = 0; i < downloadedFiles.length; i++) {
-      const file = downloadedFiles[i];
-      logger.updateSpinner(`Uploading files to target org... (${i + 1}/${downloadedFiles.length}) ${file.Title}`);
+    // Seed the map with previously completed uploads from state
+    for (const [srcDocId, tgtDocId] of Object.entries(completed)) {
+      sourceDocToTargetDoc.set(srcDocId, tgtDocId);
+    }
 
-      try {
-        const fileData = await fs.readFile(file.localPath);
-        const base64Body = fileData.toString('base64');
+    const pendingVersions = migrateableVersions.filter((cv) => !completed[cv.ContentDocumentId]);
+    const skippedCompleted = migrateableVersions.length - pendingVersions.length;
 
-        const insertResult = await targetConn.sobject('ContentVersion').create({
-          Title: file.Title,
-          PathOnClient: file.PathOnClient,
-          VersionData: base64Body,
-          Description: file.Description || '',
-        });
+    if (skippedCompleted > 0) {
+      logger.log(`  Skipping ${skippedCompleted} files already uploaded in previous run.`);
+    }
 
-        if (insertResult.success && insertResult.id) {
-          results.filesUploaded++;
-          pendingUploads.push({ versionId: insertResult.id, sourceDocId: file.ContentDocumentId });
-        } else {
-          const errMsg = (insertResult as { errors?: Array<{ message?: string }> }).errors
-            ?.map((e) => e.message).join(', ') || 'Unknown insert error';
-          throw new Error(errMsg);
-        }
-      } catch (err) {
-        results.filesFailed++;
-        results.errors.push({ file: file.Title, stage: 'upload', error: (err as Error).message });
-        logger.warn(`Failed to upload: ${file.Title} — ${(err as Error).message}`);
+    // Process in batches of BATCH_SIZE
+    for (let batchStart = 0; batchStart < pendingVersions.length; batchStart += BATCH_SIZE) {
+      if (shouldAbort?.()) {
+        aborted = true;
+        logger.warn('Pausing — saving progress...');
+        break;
       }
 
-      // Resolve ContentDocumentIds every BATCH_SIZE uploads (or at the end)
-      if (pendingUploads.length >= BATCH_SIZE || (i === downloadedFiles.length - 1 && pendingUploads.length > 0)) {
-        // Query back the uploaded ContentVersions to get their ContentDocumentIds
-        const versionIds = pendingUploads.map((u) => u.versionId);
-        const idToSourceDoc = new Map(pendingUploads.map((u) => [u.versionId, u.sourceDocId]));
+      const batchEnd = Math.min(batchStart + BATCH_SIZE, pendingVersions.length);
+      const batch = pendingVersions.slice(batchStart, batchEnd);
+      const batchNum = Math.floor(batchStart / BATCH_SIZE) + 1;
+      const totalBatches = Math.ceil(pendingVersions.length / BATCH_SIZE);
+
+      // ── Download batch ──
+      logger.updateSpinner(`Batch ${batchNum}/${totalBatches} — Downloading ${batch.length} files...`);
+      const downloadedFiles: DownloadedFile[] = [];
+
+      for (const cv of batch) {
+        if (shouldAbort?.()) break;
+
+        const filePath = path.join(tempDir, `${cv.Id}_${cv.PathOnClient}`);
+        try {
+          if (!await fs.pathExists(filePath)) {
+            await downloadContentVersion(sourceConn, cv.Id, filePath);
+          }
+          downloadedFiles.push({ ...cv, localPath: filePath });
+        } catch (err) {
+          results.filesFailed++;
+          results.errors.push({ file: cv.Title, stage: 'download', error: (err as Error).message });
+          logger.warn(`Failed to download: ${cv.Title} — ${(err as Error).message}`);
+        }
+      }
+
+      if (shouldAbort?.()) {
+        // Clean up downloaded files from this incomplete batch
+        for (const f of downloadedFiles) {
+          await fs.remove(f.localPath).catch(() => {});
+        }
+        aborted = true;
+        logger.warn('Pausing — saving progress...');
+        break;
+      }
+
+      // ── Upload batch ──
+      logger.updateSpinner(`Batch ${batchNum}/${totalBatches} — Uploading ${downloadedFiles.length} files...`);
+      const batchUploads: Array<{ versionId: string; sourceDocId: string }> = [];
+
+      for (const file of downloadedFiles) {
+        if (shouldAbort?.()) break;
+
+        try {
+          const fileData = await fs.readFile(file.localPath);
+          const base64Body = fileData.toString('base64');
+
+          const insertResult = await targetConn.sobject('ContentVersion').create({
+            Title: file.Title,
+            PathOnClient: file.PathOnClient,
+            VersionData: base64Body,
+            Description: file.Description || '',
+          });
+
+          if (insertResult.success && insertResult.id) {
+            results.filesUploaded++;
+            batchUploads.push({ versionId: insertResult.id, sourceDocId: file.ContentDocumentId });
+          } else {
+            const errMsg = (insertResult as { errors?: Array<{ message?: string }> }).errors
+              ?.map((e) => e.message).join(', ') || 'Unknown insert error';
+            throw new Error(errMsg);
+          }
+        } catch (err) {
+          results.filesFailed++;
+          results.errors.push({ file: file.Title, stage: 'upload', error: (err as Error).message });
+          logger.warn(`Failed to upload: ${file.Title} — ${(err as Error).message}`);
+        }
+      }
+
+      // ── Resolve ContentDocumentIds for this batch ──
+      const batchCompleted: Record<string, string> = {};
+      if (batchUploads.length > 0) {
+        logger.updateSpinner(`Batch ${batchNum}/${totalBatches} — Resolving document IDs...`);
+        const versionIds = batchUploads.map((u) => u.versionId);
+        const idToSourceDoc = new Map(batchUploads.map((u) => [u.versionId, u.sourceDocId]));
 
         const resolved = await queryAllChunked(
           targetConn,
@@ -299,25 +359,43 @@ export async function runMigration(options: MigrationOptions): Promise<Migration
           const sourceDocId = idToSourceDoc.get(rec.Id as string);
           if (sourceDocId && rec.ContentDocumentId) {
             sourceDocToTargetDoc.set(sourceDocId, rec.ContentDocumentId as string);
+            batchCompleted[sourceDocId] = rec.ContentDocumentId as string;
             batchResolved++;
           }
         }
 
-        // If batch query returned 0, records may not have persisted
         if (batchResolved === 0 && versionIds.length > 0) {
           logger.warn(`Batch of ${versionIds.length} uploads returned 0 resolvable records — files may not have persisted (check org storage/publication limits).`);
         }
-
-        pendingUploads = [];
       }
+
+      // ── Save state after each batch ──
+      if (onProgress && Object.keys(batchCompleted).length > 0) {
+        onProgress({ completed: batchCompleted, stats: { ...results } });
+      }
+
+      // ── Delete local files for this batch ──
+      for (const f of downloadedFiles) {
+        await fs.remove(f.localPath).catch(() => {});
+      }
+
+      logger.updateSpinner(`Migrating files... (${Math.min(batchEnd, pendingVersions.length)}/${pendingVersions.length})`);
     }
 
-    logger.stopSpinner(`Uploaded ${results.filesUploaded} files. Resolved ${sourceDocToTargetDoc.size} document IDs.`);
+    const migrateMsg = `Migrated ${results.filesUploaded} files. Resolved ${sourceDocToTargetDoc.size} document IDs.` +
+      (skippedCompleted > 0 ? ` (${skippedCompleted} previously completed)` : '') +
+      (aborted ? ' (paused)' : '');
+    logger.stopSpinner(migrateMsg);
 
     if (sourceDocToTargetDoc.size === 0 && results.filesUploaded > 0) {
       logger.warn('No document ID mappings resolved — ContentDocumentLinks cannot be created.');
       logger.warn('This typically means the target org has exceeded its ContentPublication (file upload) daily limit.');
       logger.warn('Wait 24 hours for the limit to reset, then retry.');
+    }
+
+    // If aborted, skip Step 8 and cleanup — return early
+    if (aborted) {
+      return results;
     }
 
     // ─── Step 8: Create ContentDocumentLinks in target ────────────────────
@@ -347,11 +425,39 @@ export async function runMigration(options: MigrationOptions): Promise<Migration
       }
     }
 
+    // Dedup: query target for existing ContentDocumentLinks to avoid duplicates on resume
+    const targetDocIds = [...new Set(linksToCreate.map((l) => l.ContentDocumentId))];
+    let existingLinkKeys = new Set<string>();
+
+    if (targetDocIds.length > 0) {
+      logger.updateSpinner('Checking for existing links in target...');
+      const existingLinks = await queryAllChunked(
+        targetConn,
+        targetDocIds,
+        (chunk) =>
+          `SELECT ContentDocumentId, LinkedEntityId
+           FROM ContentDocumentLink
+           WHERE ContentDocumentId IN (${chunk.map((id) => `'${id}'`).join(',')})`
+      );
+      existingLinkKeys = new Set(
+        existingLinks.map((l) => `${l.ContentDocumentId as string}:${l.LinkedEntityId as string}`)
+      );
+    }
+
+    const newLinks = linksToCreate.filter(
+      (l) => !existingLinkKeys.has(`${l.ContentDocumentId}:${l.LinkedEntityId}`)
+    );
+
+    if (existingLinkKeys.size > 0 && newLinks.length < linksToCreate.length) {
+      const dupeCount = linksToCreate.length - newLinks.length;
+      logger.log(`  Skipping ${dupeCount} links that already exist in target.`);
+    }
+
     // Insert in batches
-    for (let i = 0; i < linksToCreate.length; i += BATCH_SIZE) {
-      const batch = linksToCreate.slice(i, i + BATCH_SIZE);
+    for (let i = 0; i < newLinks.length; i += BATCH_SIZE) {
+      const batch = newLinks.slice(i, i + BATCH_SIZE);
       logger.updateSpinner(
-        `Creating ContentDocumentLinks in target... (${Math.min(i + BATCH_SIZE, linksToCreate.length)}/${linksToCreate.length})`
+        `Creating ContentDocumentLinks in target... (${Math.min(i + BATCH_SIZE, newLinks.length)}/${newLinks.length})`
       );
 
       try {
@@ -380,6 +486,7 @@ export async function runMigration(options: MigrationOptions): Promise<Migration
     }
 
     // ─── Cleanup ──────────────────────────────────────────────────────────
+    // Only clean up temp when migration completed fully (not on pause/abort)
     if (tempDir) {
       await cleanupTempDir(tempDir);
     }
@@ -387,9 +494,7 @@ export async function runMigration(options: MigrationOptions): Promise<Migration
     logger.stopSpinnerFail('Error');
     results.errors.push({ stage: 'fatal', error: (err as Error).message });
     logger.log(`\n  Fatal error: ${(err as Error).message}\n`);
-    if (tempDir) {
-      await cleanupTempDir(tempDir);
-    }
+    // Don't clean up temp on error — may be needed for resume
   }
 
   return results;
